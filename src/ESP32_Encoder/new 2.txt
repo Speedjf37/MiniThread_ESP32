@@ -1,0 +1,212 @@
+/*
+   Project, use solar cells to generate power
+   2/2/2020
+
+*/
+// https://docs.espressif.com/projects/esp-idf/en/latest/api-reference/system/esp_timer.html
+///esp_timer_get_time(void) //gets time in uSeconds like Arduino Micros, not tested. see above link
+//////// http://www.iotsharing.com/2017/09/how-to-use-arduino-esp32-can-interface.html
+#include "sdkconfig.h"
+#include "esp_system.h" //This inclusion configures the peripherals in the ESP system.
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+#include "freertos/event_groups.h"
+// #include "esp32/ulp.h"
+// #include "driver/rtc_io.h"
+#include <SimpleKalmanFilter.h>
+#include <driver/adc.h>
+#include "esp_sleep.h"
+#include "driver/mcpwm.h"
+const int TaskCore1 = 1;
+const int TaskCore0 = 0;
+const int TaskStack20K = 20000;
+const int Priority3 = 3;
+const int Priority4 = 4;
+const int SerialDataBits = 115200;
+volatile bool EnableTracking = true;
+////
+//
+////
+void setup()
+{
+  Serial.begin( 115200 );
+  // https://dl.espressif.com/doc/esp-idf/latest/api-reference/peripherals/adc.html
+  // set up A:D channels
+  adc_power_on( );
+  vTaskDelay( 1 );
+  adc1_config_width(ADC_WIDTH_12Bit);
+  // ADC1 channel 0 is GPIO36 (ESP32), GPIO1 (ESP32-S2)
+  adc1_config_channel_atten(ADC1_CHANNEL_0 , ADC_ATTEN_DB_11);
+  // ADC1_CHANNEL_3  ADC1 channel 3 is GPIO39 (ESP32)
+  adc1_config_channel_atten(ADC1_CHANNEL_3, ADC_ATTEN_DB_11);
+  // ADC1 channel 5 is GPIO33
+  adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_DB_11);
+  // ADC1 channel 6 is GPIO34
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);
+  // adc for light dark detection, ADC1 channel 7 is GPIO35 (ESP32)
+  adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_11);
+  //
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM1A, GPIO_NUM_4 ); // Azimuth
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, GPIO_NUM_12 ); // Altitude servo
+  //  ////
+  mcpwm_config_t pwm_config = {};
+  pwm_config.frequency = 50;    //frequency = 50Hz, i.e. for every servo motor time period should be 20ms
+  pwm_config.cmpr_a = 0;    //duty cycle of PWMxA = 0
+  pwm_config.cmpr_b = 0;    //duty cycle of PWMxb = 0
+  pwm_config.counter_mode = MCPWM_UP_COUNTER;
+  pwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+  mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_0, &pwm_config);    //Configure PWM0A timer 0 with above settings
+  mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_1, &pwm_config);    //Configure PWM0A timer 1 with above settings
+  //  ////
+  fMoveAltitude( 1500 );
+  vTaskDelay( 10 );
+  fMoveAzimuth( 1500 );
+  vTaskDelay(10);
+  ////
+  xTaskCreatePinnedToCore( TrackSun, "TrackSun", TaskStack20K, NULL, Priority3, NULL, TaskCore1 ); // assigned to core
+  xTaskCreatePinnedToCore( fDaylight, "fDaylight", TaskStack20K, NULL, Priority3, NULL, TaskCore0 ); // assigned to core
+  esp_sleep_enable_timer_wakeup( 5000000 ); // set timer to wake up once a second
+}
+//
+void fDaylight( void * pvParameters )
+{
+  // int lightLevel = 0;
+  while (1)
+  {
+    vTaskDelay( 1000 );
+    if ( adc1_get_raw(ADC1_CHANNEL_7) <= 500 )
+    {
+      // if light level to low park boom
+      fMoveAltitude( 1500 );
+      vTaskDelay( 12 );
+      fMoveAzimuth( 1500 );
+      vTaskDelay(12);
+      // put esp32 into light sleep
+      EnableTracking = false;
+      esp_light_sleep_start();
+    } else {
+      EnableTracking = true;
+    }
+  }
+} // void fDaylight( void * pvParameters )
+////
+/**
+   @brief Use this function to calcute pulse width for per degree rotation
+   @param  degree_of_rotation the angle in degree to which servo has to rotate
+   @return
+       - calculated pulse width
+*/
+////
+void mcpwm_gpio_initialize(void)
+{
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM1A, GPIO_NUM_4 );
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, GPIO_NUM_12 );
+}
+////
+void TrackSun( void * pvParameters )
+{
+  int Altitude = 1500;
+  int Azimuth = 1500;
+  int maxAltitudeRange = 2144;
+  int minAltitudeRange = 900;
+  int maxAzimuthRange = 2144;
+  int minAzimuthRange = 900;
+  SimpleKalmanFilter kfAltitude0( 5.0, 10.0, .01 ); // kalman filter Altitude 0
+  SimpleKalmanFilter kfAltitude1( 5.0, 10.0, .01 ); // kalman filter Altitude 1
+  SimpleKalmanFilter kfAzimuth0( 5.0, 5.0, .01 ); // kalman filter Azimuth 0
+  SimpleKalmanFilter kfAzimuth1( 5.0, 5.0, .01 ); // kalman filter Azimuth 1
+  float filteredAltitude_0 = 0.0f;
+  float filteredAltitude_1 = 0.0f;
+  float filteredAzimuth_0 = 0.0f;
+  float filteredAzimuth_1 = 0.0f;
+  int64_t AzimuthEndTime = esp_timer_get_time();
+  int64_t AzimuthStartTime = esp_timer_get_time(); //gets time in uSeconds like Arduino Micros,
+  int64_t AltitudeEndTime = esp_timer_get_time();
+  int64_t AltitudeStartTime = esp_timer_get_time(); //gets time in uSeconds like Arduino Micros,
+  //  Serial.println( Azimuth );
+  float AltitudeThreashold = 80.0f;
+  float AzimuthThreashold = 60.0f;
+  while (1)
+  {
+    if ( EnableTracking )
+    {
+      //Altitude
+      AltitudeEndTime = esp_timer_get_time() - AltitudeStartTime; // produce elasped time for the simpleKalmanFilter
+      kfAltitude0.setProcessNoise( (float)AltitudeEndTime / 1000000.0f ); //convert time of process to uS, update SimpleKalmanFilter q
+      kfAltitude1.setProcessNoise( (float)AltitudeEndTime / 1000000.0f ); //convert time of process to uS, update SimpleKalmanFilter q
+      filteredAltitude_0 = kfAltitude0.updateEstimate( (float)adc1_get_raw(ADC1_CHANNEL_3) );
+      filteredAltitude_1 = kfAltitude1.updateEstimate( (float)adc1_get_raw(ADC1_CHANNEL_0) );
+      if ( (filteredAltitude_0 > filteredAltitude_1) && (abs(filteredAltitude_0 - filteredAltitude_1) > AltitudeThreashold))
+      {
+        // Serial.println( "filteredAltitude_0 > filteredAltitude_1" );
+        Altitude -= 1;
+        if ( Altitude < minAltitudeRange )
+        {
+          Altitude = 1500;
+        }
+        fMoveAltitude( Altitude );
+        vTaskDelay( 12 );
+        AltitudeStartTime = esp_timer_get_time();
+      }
+      if ( (filteredAltitude_0 < filteredAltitude_1) && (abs(filteredAltitude_0 - filteredAltitude_1) > AltitudeThreashold) )
+      {
+        // Serial.println( "filteredAltitude_0 < filteredAltitude_1" );
+        Altitude += 1;
+        if ( Altitude >= maxAltitudeRange )
+        {
+          Altitude = 1500;
+        }
+        fMoveAltitude( Altitude );
+        vTaskDelay( 12 );
+        AltitudeStartTime = esp_timer_get_time();
+      }
+      // Serial.println();
+      //// AZIMUTH
+      AzimuthEndTime = esp_timer_get_time() - AzimuthStartTime; // produce elasped time for the simpleKalmanFilter
+      kfAzimuth0.setProcessNoise( (float)AzimuthEndTime / 1000000.0f ); //convert time of process to uS, update SimpleKalmanFilter q
+      kfAzimuth1.setProcessNoise( (float)AzimuthEndTime / 1000000.0f ); //convert time of process to uS, update SimpleKalmanFilter q
+      filteredAzimuth_0 = kfAzimuth0.updateEstimate( (float)adc1_get_raw(ADC1_CHANNEL_5) );
+      if ( (filteredAzimuth_0 > filteredAzimuth_1) && (abs(filteredAzimuth_0 - filteredAzimuth_1)) > AzimuthThreashold )
+      {
+        Azimuth += 2;
+        // Serial.println( Azimuth );
+        if ( Azimuth >= maxAzimuthRange )
+        {
+          Azimuth = 900;
+        }
+        fMoveAzimuth( Azimuth );
+        vTaskDelay( 12 );
+        AzimuthStartTime = esp_timer_get_time();
+      }
+      //    //
+      if ( (filteredAzimuth_0 < filteredAzimuth_1) && (abs(filteredAzimuth_1 - filteredAzimuth_0)) > AzimuthThreashold )
+      {
+        Azimuth -= 2;
+        if ( (Azimuth >= maxAzimuthRange) || (Azimuth <= minAzimuthRange) )
+        {
+          Azimuth = 900;
+        }
+        fMoveAzimuth( Azimuth );
+        vTaskDelay( 12 );
+        AzimuthStartTime = esp_timer_get_time();
+      }
+    }
+    // Serial.println();
+    vTaskDelay( 30 );
+    //
+  } // while(1)
+} //void TrackSun()
+////
+void fMoveAltitude( int MoveTo )
+{
+  mcpwm_set_duty_in_us(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, MoveTo);
+}
+//////
+void fMoveAzimuth( int MoveTo )
+{
+  mcpwm_set_duty_in_us(MCPWM_UNIT_0, MCPWM_TIMER_1, MCPWM_OPR_A, MoveTo);
+}
+////
+void loop() {}
+////
